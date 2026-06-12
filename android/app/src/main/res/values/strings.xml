@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">Allows an authorized administrator to control this device (taps, swipes, and text) during a remote support session.</string>
+</resources>
