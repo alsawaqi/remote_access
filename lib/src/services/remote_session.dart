@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../input/input_dispatcher.dart';
@@ -39,11 +38,13 @@ class RemoteSession {
 
     _pc!.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate == null) return;
-      api.postIce(sessionId, {
-        'candidate': candidate.candidate,
-        'sdpMid': candidate.sdpMid,
-        'sdpMLineIndex': candidate.sdpMLineIndex,
-      }).catchError((_) {});
+      api
+          .postIce(sessionId, {
+            'candidate': candidate.candidate,
+            'sdpMid': candidate.sdpMid,
+            'sdpMLineIndex': candidate.sdpMLineIndex,
+          })
+          .catchError((_) {});
     };
 
     _pc!.onConnectionState = (RTCPeerConnectionState state) {
@@ -92,19 +93,36 @@ class RemoteSession {
   }
 
   Future<void> onAnswer(String sdp) async {
-    if (kDebugMode) {
-      debugPrint('[remote] onAnswer sdp.length=${sdp.length}');
-    }
-    await _pc?.setRemoteDescription(RTCSessionDescription(sdp, 'answer'));
+    await _pc?.setRemoteDescription(
+      RTCSessionDescription(_sanitizeSdp(sdp), 'answer'),
+    );
+  }
+
+  /// Defensive SDP normalization for the answer we receive. Two independent
+  /// issues can otherwise make libwebrtc reject it with the misleading
+  /// "SessionDescription is NULL": (1) some flutter_webrtc/libwebrtc builds emit
+  /// SDP with non-CRLF or doubled line endings, and (2) a trailing CRLF can be
+  /// stripped in transit. Cause (2) is now fixed centrally on the API (its
+  /// TrimStrings middleware excludes the `sdp` field), so this stays as a cheap
+  /// safety net: split on any newline, trim, drop blank lines, rejoin with CRLF.
+  String _sanitizeSdp(String sdp) {
+    final lines = sdp
+        .split(RegExp(r'\r\n|\r|\n'))
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+    return '${lines.join('\r\n')}\r\n';
   }
 
   Future<void> onRemoteIce(Map<String, dynamic> candidate) async {
     if (candidate['candidate'] == null) return;
-    await _pc?.addCandidate(RTCIceCandidate(
-      candidate['candidate'] as String?,
-      candidate['sdpMid'] as String?,
-      (candidate['sdpMLineIndex'] as num?)?.toInt(),
-    ));
+    await _pc?.addCandidate(
+      RTCIceCandidate(
+        candidate['candidate'] as String?,
+        candidate['sdpMid'] as String?,
+        (candidate['sdpMLineIndex'] as num?)?.toInt(),
+      ),
+    );
   }
 
   Future<void> close({bool notify = false}) async {

@@ -26,7 +26,13 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         // Remote control requires Android 11+ (foreground-service media projection rules).
         minSdk = 30
-        targetSdk = 35
+        // targetSdk is intentionally pinned to 33. Android 14 (SDK 34+) re-enforces a
+        // per-session MediaProjection consent dialog that cannot be suppressed — which
+        // would break UNATTENDED kiosk screen capture. Targeting 33 keeps the one-time
+        // `appops PROJECT_MEDIA allow` grant effective (tap-free capture). This app is
+        // side-loaded via the MDM (not Google Play), so the Play targetSdk floor does
+        // not apply. See provisioning/README.md.
+        targetSdk = 33
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }

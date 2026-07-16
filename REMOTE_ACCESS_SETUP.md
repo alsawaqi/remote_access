@@ -16,7 +16,7 @@ flutter pub get
 Versions in `pubspec.yaml` were set to recent releases; if pub can't resolve a
 constraint (this is a fast-moving set), run:
 ```bash
-flutter pub add flutter_webrtc pusher_channels_flutter flutter_secure_storage \
+flutter pub add flutter_webrtc dart_pusher_channels flutter_secure_storage \
   permission_handler http device_info_plus package_info_plus
 ```
 
@@ -39,17 +39,66 @@ The Reverb **app key** is delivered by the enrollment response (not hard-coded).
 
 ## Permissions the technician grants on the device (one-time, per Phase 0)
 - **Screen capture (MediaProjection):** approved when the first session starts.
-  On stock Android 11+ this prompt reappears after a reboot / capture-service
-  kill — keep the app foregrounded; full unattended capture needs the
-  Scalefusion Device-Owner path (future).
 - **AccessibilityService:** enabled in Settings (Phase 5 wires the native side).
 
+## ⚠️ Android 14 (API 34+) screen-capture requirement — READ THIS
+On Android 14+, starting the `mediaProjection` foreground service throws a
+`SecurityException` unless the **`project_media` app-op** is granted. A fresh
+install does NOT have it (default mode `ignore`). Symptoms if it's missing:
+
+- **Before the fix:** the app hard-crashed ("remote_access has stopped") the
+  moment a session started — the uncaught exception in
+  `ScreenCaptureService.onStartCommand` killed the process.
+- **After the fix (current):** the service catches the failure, the session is
+  aborted cleanly, and the admin sees *"Screen capture could not start…"*
+  instead of a crash. **But the screen still won't share until the op is
+  granted.** The fix removes the crash; it does not remove the requirement.
+
+Grant the op (this is the kiosk/unattended mechanism):
+
+```bash
+# Per device, via adb (or the MDM equivalent):
+adb shell appops set com.example.remote_access PROJECT_MEDIA allow
+# verify -> should print: PROJECT_MEDIA: allow
+adb shell appops get com.example.remote_access PROJECT_MEDIA
+```
+
+### Granting it on the fleet — `targetSdk 33` + adb provisioning (the working method)
+This app is built with **`targetSdk = 33`** and side-loaded via the MDM (not
+Google Play). That is deliberate: apps targeting SDK 34+ are subject to Android
+14's per-session MediaProjection consent that cannot be suppressed, which would
+break unattended capture. Targeting 33 keeps the **`project_media` app-op grant
+effective**, so once granted the "Start casting?" dialog never appears, and the
+grant **survives reboot** (confirmed in AOSP
+`MediaProjectionManagerService.hasProjectionPermission` — the consent activity
+short-circuits to RESULT_OK when the op is allowed).
+
+Grant it **once per device via adb** during setup — see **[`provisioning/`](provisioning/)**:
+`setup-remote-access.sh` grants `PROJECT_MEDIA`, enables the AccessibilityService
+(for input), and battery-exempts the app. All three survive reboot; re-run only
+if the app is reinstalled or its data cleared. **Validate on one device first**
+(see `provisioning/README.md`) — success = the screen streams with NO dialog on
+the kiosk.
+
+Why adb and not an MDM policy: `project_media` is an Android **app-op** (setting
+it needs signature-level `MANAGE_APP_OPS_MODES`), not a runtime permission — so no
+Scalefusion policy grants it, but adb during the normal "exit kiosk → set up →
+return to kiosk" window does. This is the supported path for the generic-Android
+fleet (UMIDIGI Z93 / Bluemake / FEITIAN — no Knox, no Sunmi OEM lock).
+
+**Fallback — locked devices you can't adb into** (e.g. Samsung Knox, or a Sunmi
+build with no setup window): the app-op can only be set by a platform-signed
+helper, or by OEM-signing the APK to hold `CAPTURE_VIDEO_OUTPUT` — i.e. an OEM
+partner agreement. Not needed for the adb-provisioned fleet above.
+
+> After changing any of the native (Kotlin) code, rebuild and **redeploy the APK
+> to the kiosks** — the running production build still has the old crash.
+
 ## Verify
-Because no Dart/Flutter toolchain was available where this code was generated,
-it has NOT been compiled here. Build it yourself:
 ```bash
 flutter analyze
-flutter run            # or: flutter build apk --debug
+flutter build apk --debug   # compiles Dart + the Kotlin native side
+flutter run                 # to run on a connected device
 ```
 
 ## Phase 5 boundary
