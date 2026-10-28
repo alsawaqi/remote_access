@@ -12,7 +12,8 @@
          add the service entry from your installed flutter_webrtc version's README. -->
 
     <application
-        android:label="remote_access"
+        android:label="Remote Access Agent"
+        android:allowBackup="false"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

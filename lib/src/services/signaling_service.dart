@@ -3,11 +3,79 @@ import 'dart:convert';
 
 import 'package:dart_pusher_channels/dart_pusher_channels.dart';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 
 import '../config.dart';
 import 'api_client.dart';
 
 typedef EventHandler = void Function(Map<String, dynamic> data);
+
+/// Called when authorizing a private channel against /broadcasting/auth fails.
+/// [status] is the HTTP status of the auth endpoint's response, or null when
+/// no HTTP response was received (timeout, network error, ...).
+typedef ChannelAuthErrorHandler = void Function(int? status);
+
+class _ChannelAuthException implements Exception {
+  final int? status;
+  final String message;
+  _ChannelAuthException(this.status, this.message);
+
+  @override
+  String toString() => 'ChannelAuthException(${status ?? '-'}): $message';
+}
+
+/// Private-channel authorizer. Same wire format as the package's
+/// EndpointAuthorizableChannelTokenAuthorizationDelegate.forPrivateChannel
+/// (form-encoded POST of socket_id + channel_name to /broadcasting/auth with
+/// the device bearer token), plus the agent-wide request timeout and the HTTP
+/// status surfaced on failure.
+class _DeviceChannelAuthDelegate
+    implements
+        EndpointAuthorizableChannelAuthorizationDelegate<
+            PrivateChannelAuthorizationData> {
+  _DeviceChannelAuthDelegate({required this.token, required this.onAuthFailed});
+
+  final String token;
+
+  @override
+  final EndpointAuthFailedCallback? onAuthFailed;
+
+  @override
+  Future<PrivateChannelAuthorizationData> authorizationData(
+    String socketId,
+    String channelName,
+  ) async {
+    final http.Response response;
+    try {
+      response = await http.post(
+        Uri.parse('${AppConfig.apiBase}/broadcasting/auth'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Accept': 'application/json',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: {'socket_id': socketId, 'channel_name': channelName},
+      ).timeout(ApiClient.requestTimeout);
+    } on TimeoutException {
+      throw _ChannelAuthException(null, 'channel authorization timed out');
+    }
+
+    if (response.statusCode != 200) {
+      throw _ChannelAuthException(response.statusCode, 'channel authorization refused');
+    }
+    final dynamic decoded;
+    try {
+      decoded = jsonDecode(response.body);
+    } catch (_) {
+      throw _ChannelAuthException(response.statusCode, 'invalid authorization response');
+    }
+    final auth = decoded is Map ? decoded['auth'] : null;
+    if (auth is! String || auth.isEmpty) {
+      throw _ChannelAuthException(response.statusCode, 'authorization response has no auth key');
+    }
+    return PrivateChannelAuthorizationData(authKey: auth);
+  }
+}
 
 /// Connects to self-hosted Laravel Reverb over the Pusher protocol and binds
 /// private-channel events. Private channels are authorized against the API's
@@ -57,18 +125,28 @@ class SignalingService {
   }
 
   /// Subscribe to a private channel and bind one handler per event name.
-  void subscribePrivate(String name, Map<String, EventHandler> handlers) {
+  ///
+  /// [onAuthError] fires when the channel's authorization request fails, e.g.
+  /// with HTTP 401 once the device token has been revoked (on the first
+  /// subscribe or on any re-subscribe after a reconnect).
+  void subscribePrivate(
+    String name,
+    Map<String, EventHandler> handlers, {
+    ChannelAuthErrorHandler? onAuthError,
+  }) {
     final client = _client;
     if (client == null) return;
 
     final channel = client.privateChannel(
       name,
-      authorizationDelegate:
-          EndpointAuthorizableChannelTokenAuthorizationDelegate.forPrivateChannel(
-        authorizationEndpoint: Uri.parse('${AppConfig.apiBase}/broadcasting/auth'),
-        headers: {
-          'Authorization': 'Bearer ${api.token ?? ''}',
-          'Accept': 'application/json',
+      authorizationDelegate: _DeviceChannelAuthDelegate(
+        token: api.token ?? '',
+        onAuthFailed: (exception, trace) {
+          final status = exception is _ChannelAuthException ? exception.status : null;
+          if (kDebugMode) {
+            debugPrint('[signaling] auth failed for "$name" (status=$status)');
+          }
+          onAuthError?.call(status);
         },
       ),
     );
@@ -79,7 +157,12 @@ class SignalingService {
         if (kDebugMode) {
           debugPrint('[signaling] recv "$eventName" type=${event.data.runtimeType} data=${event.data}');
         }
-        handler(_decode(event.data));
+        // A malformed payload must never surface as an unhandled stream error.
+        try {
+          handler(_decode(event.data));
+        } catch (error) {
+          debugPrint('[signaling] handler for "$eventName" failed: $error');
+        }
       }));
     });
 
@@ -117,7 +200,8 @@ class SignalingService {
     // instead of just the inner payload — unwrap the nested `data` in that case.
     final looksLikePayload = map.containsKey('sdp') ||
         map.containsKey('candidate') ||
-        map.containsKey('session_id');
+        map.containsKey('session_id') ||
+        map.containsKey('device_id');
     if (!looksLikePayload && map['data'] != null) {
       var inner = map['data'];
       if (inner is String) {

@@ -1,4 +1,4 @@
-package com.example.remote_access
+package net.mithqal.remoteaccess
 
 import android.content.ComponentName
 import android.content.Intent

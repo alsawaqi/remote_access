@@ -1,4 +1,4 @@
-package com.example.remote_access
+package net.mithqal.remoteaccess
 
 import android.app.Notification
 import android.app.NotificationChannel

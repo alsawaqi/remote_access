@@ -1,0 +1,14 @@
+# Release-signing configuration for the Remote Access Agent.
+#
+# Copy this file to android/key.properties (same folder) and replace the
+# placeholders. android/key.properties is gitignored: NEVER commit it, and keep
+# the keystore itself OUTSIDE this repository (see "Release signing" in
+# REMOTE_ACCESS_SETUP.md).
+#
+# storeFile: absolute path to the release keystore (.jks). A relative path is
+#            resolved from android/app/. On Windows use forward slashes,
+#            e.g. C:/secure/remote-access-release.jks
+storeFile=/absolute/path/outside/the/repo/remote-access-release.jks
+storePassword=CHANGE_ME
+keyAlias=remote-access
+keyPassword=CHANGE_ME

@@ -1,4 +1,4 @@
-package com.example.remote_access
+package net.mithqal.remoteaccess
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription

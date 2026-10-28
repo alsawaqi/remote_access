@@ -17,14 +17,23 @@ enum DaemonPhase { notEnrolled, connecting, online, error }
 /// drives a [RemoteSession] when the admin requests one. Exposes state via
 /// ChangeNotifier for the UI.
 class DeviceDaemon extends ChangeNotifier {
+  static const String revokedMessage =
+      'Remote access was revoked by an administrator. Enrol again with a new code.';
+
   final SecureStore store = SecureStore();
   final ApiClient api = ApiClient();
   final InputDispatcher input = InputDispatcher();
 
   SignalingService? _signaling;
   RemoteSession? _session;
+  String? _sessionChannel;
+  Future<void> _lastTeardown = Future<void>.value();
   Timer? _heartbeat;
-  String? _deviceChannel;
+  bool _heartbeatInFlight = false;
+
+  /// Bumped whenever the enrollment changes (start / revoke / unenrol) so
+  /// late callbacks from a previous enrollment cannot act on the current one.
+  int _epoch = 0;
 
   DaemonPhase phase = DaemonPhase.notEnrolled;
   String connection = 'disconnected';
@@ -83,42 +92,83 @@ class DeviceDaemon extends ChangeNotifier {
   }
 
   Future<void> _start() async {
+    final epoch = ++_epoch;
+
+    // Never keep two signaling connections / heartbeat loops alive.
+    _heartbeat?.cancel();
+    _heartbeat = null;
+    final previous = _signaling;
+    _signaling = null;
+    if (previous != null) {
+      try {
+        await previous.disconnect();
+      } catch (_) {}
+    }
+
     final reverbKey = await store.reverbKey() ?? '';
-    _deviceChannel = await store.channel() ?? 'private-device.$deviceId';
+    final deviceChannel = await store.channel() ?? 'private-device.$deviceId';
+    if (epoch != _epoch) return;
 
     phase = DaemonPhase.connecting;
     error = null;
     notifyListeners();
 
-    _signaling = SignalingService(
+    final signaling = SignalingService(
       api: api,
       reverbKey: reverbKey,
       onConnectionChange: (connected) {
+        if (epoch != _epoch) return;
         connection = connected ? 'connected' : 'connecting';
         if (connected) phase = DaemonPhase.online;
         notifyListeners();
       },
     );
+    _signaling = signaling;
 
-    await _signaling!.connect();
-    _signaling!.subscribePrivate(_deviceChannel!, {
-      'session.requested': (data) => _onSessionRequested(data),
-      'session.ended': (_) => _endSession(notifyServer: false),
-    });
+    await signaling.connect();
+    if (epoch != _epoch) return; // revoked / unenrolled while connecting
 
-    _startHeartbeat();
+    signaling.subscribePrivate(
+      deviceChannel,
+      {
+        'session.requested': (data) => _onSessionRequested(data, epoch),
+        'session.ended': _onSessionEndedEvent,
+        'device.revoked': (data) => _onDeviceRevokedEvent(data, epoch),
+      },
+      // 401 from /broadcasting/auth = the device token no longer exists.
+      onAuthError: (status) {
+        if (status == 401) _handleRevoked(epoch);
+      },
+    );
+
+    _startHeartbeat(epoch);
   }
 
-  void _startHeartbeat() {
+  void _startHeartbeat(int epoch) {
     _heartbeat?.cancel();
-    _sendHeartbeat();
-    _heartbeat = Timer.periodic(AppConfig.heartbeatInterval, (_) => _sendHeartbeat());
+    _sendHeartbeat(epoch);
+    _heartbeat = Timer.periodic(
+      AppConfig.heartbeatInterval,
+      (_) => _sendHeartbeat(epoch),
+    );
   }
 
-  Future<void> _sendHeartbeat() async {
+  Future<void> _sendHeartbeat(int epoch) async {
+    // One heartbeat at a time: a slow network must not stack requests.
+    if (_heartbeatInFlight || epoch != _epoch) return;
+    _heartbeatInFlight = true;
     try {
-      await api.heartbeat(await _capabilities());
-    } catch (_) {/* transient */}
+      final caps = await _capabilities();
+      if (epoch != _epoch) return;
+      await api.heartbeat(caps, activeSessionId: _session?.sessionId);
+    } on ApiException catch (e) {
+      if (e.isUnauthorized) await _handleRevoked(epoch);
+      // Anything else is transient; the next tick retries.
+    } catch (_) {
+      /* transient */
+    } finally {
+      _heartbeatInFlight = false;
+    }
   }
 
   Future<Map<String, dynamic>> _capabilities() async {
@@ -141,68 +191,180 @@ class DeviceDaemon extends ChangeNotifier {
     };
   }
 
-  Future<void> _onSessionRequested(Map<String, dynamic> data) async {
-    if (_session != null) return; // one session at a time
+  Future<void> _onSessionRequested(Map<String, dynamic> data, int epoch) async {
+    if (epoch != _epoch || _session != null) return; // one session at a time
 
-    final sessionId = (data['session_id'] as num).toInt();
-    final iceServers = (data['ice_servers'] as List?) ?? <dynamic>[];
+    final signaling = _signaling;
+    final sessionId = _asInt(data['session_id']);
+    if (signaling == null || sessionId == null) return;
+
+    final rawIceServers = data['ice_servers'];
+    final iceServers = rawIceServers is List ? rawIceServers : <dynamic>[];
     final controlEnabled = data['control_enabled'] == true;
-    final sessionChannel =
-        data['channel'] as String? ?? 'private-remote-session.$sessionId';
+    final rawChannel = data['channel'];
+    final sessionChannel = rawChannel is String && rawChannel.isNotEmpty
+        ? rawChannel
+        : 'private-remote-session.$sessionId';
 
-    _signaling!.subscribePrivate(sessionChannel, {
-      'webrtc.answer': (d) => _session?.onAnswer(d['sdp'] as String? ?? ''),
-      'webrtc.ice': (d) {
-        if (d['from'] != 'device') _session?.onRemoteIce(d);
-      },
-      'session.ended': (_) => _endSession(notifyServer: false),
-    });
-
-    _session = RemoteSession(
+    final session = RemoteSession(
       sessionId: sessionId,
       api: api,
       iceServers: iceServers,
       controlEnabled: controlEnabled,
       input: input,
-      onClosed: () => _endSession(notifyServer: true),
+      // The session ended itself (connection failure, negotiation timeout,
+      // rejected answer): tell the API why.
+      onClosed: (s, reason) => _endSession(s, notifyServer: true, reason: reason),
+      onUnauthorized: () => _handleRevoked(epoch),
     );
 
+    _session = session;
+    _sessionChannel = sessionChannel;
     sessionActive = true;
     controlActive = controlEnabled;
     notifyListeners();
 
+    // Give the previous session a moment to release its peer connection and
+    // projection before this one acquires new ones. This wait is NOT what
+    // protects this session's capture: ScreenCaptureController only stops the
+    // shared service once no session holds it, so the previous session's late
+    // "stop" (its teardown can outlast this bound — each step has its own 5 s
+    // limit) is a no-op once this session has started capture.
+    await _lastTeardown.timeout(const Duration(seconds: 10), onTimeout: () {});
+    if (!identical(_session, session)) return; // ended while waiting
+
+    signaling.subscribePrivate(
+      sessionChannel,
+      {
+        'webrtc.answer': (d) {
+          if (!identical(_session, session)) return;
+          final sdp = d['sdp'];
+          unawaited(session.onAnswer(sdp is String ? sdp : ''));
+        },
+        'webrtc.ice': (d) {
+          if (d['from'] == 'device' || !identical(_session, session)) return;
+          unawaited(session.onRemoteIce(d));
+        },
+        'session.ended': _onSessionEndedEvent,
+      },
+      onAuthError: (status) {
+        if (status == 401) _handleRevoked(epoch);
+      },
+    );
+
     try {
-      await _session!.start();
+      await session.start();
+    } on SessionStartException catch (e) {
+      if (identical(_session, session)) error = 'Capture/offer failed: ${e.message}';
+      await _endSession(session, notifyServer: true, reason: e.reason);
     } catch (e) {
-      error = 'Capture/offer failed: $e';
-      await _endSession(notifyServer: true);
+      if (identical(_session, session)) error = 'Capture/offer failed: $e';
+      await _endSession(session, notifyServer: true, reason: EndReason.offerFailed);
     }
   }
 
-  Future<void> _endSession({required bool notifyServer}) async {
+  /// `session.ended` (device channel and session channel): only tear down when
+  /// it is about the session this device is currently serving.
+  void _onSessionEndedEvent(Map<String, dynamic> data) {
     final session = _session;
-    final sessionId = session?.sessionId;
+    final endedId = _asInt(data['session_id']);
+    if (session == null || endedId == null || endedId != session.sessionId) return;
+    _endSession(session, notifyServer: false);
+  }
 
+  void _onDeviceRevokedEvent(Map<String, dynamic> data, int epoch) {
+    final revokedId = _asInt(data['device_id']);
+    if (revokedId != null && deviceId != null && revokedId != deviceId) return;
+    _handleRevoked(epoch);
+  }
+
+  /// Ends [session] — and only that instance. If it is not the live session
+  /// any more (already ended or replaced) it is just released.
+  Future<void> _endSession(
+    RemoteSession session, {
+    required bool notifyServer,
+    String reason = EndReason.endedByDevice,
+  }) async {
+    final closing = session.close(); // idempotent: returns the teardown in flight
+
+    if (!identical(_session, session)) {
+      try {
+        await closing;
+      } catch (_) {}
+      return;
+    }
+
+    final epoch = _epoch;
+    final channel = _sessionChannel;
     _session = null;
+    _sessionChannel = null;
     sessionActive = false;
     controlActive = false;
     notifyListeners();
 
-    await session?.close();
+    final teardown = closing.catchError((Object _) {});
+    _lastTeardown = teardown;
 
-    if (sessionId != null) {
+    if (channel != null) {
       try {
-        await _signaling?.unsubscribe('private-remote-session.$sessionId');
+        await _signaling?.unsubscribe(channel);
       } catch (_) {}
-      if (notifyServer) {
-        try {
-          await api.endSession(sessionId);
-        } catch (_) {}
-      }
     }
+    if (notifyServer) {
+      try {
+        await api.endSession(session.sessionId, reason: reason);
+      } on ApiException catch (e) {
+        if (e.isUnauthorized) await _handleRevoked(epoch);
+      } catch (_) {}
+    }
+
+    await teardown;
   }
 
-  Future<void> stopSessionByUser() => _endSession(notifyServer: true);
+  /// Remote access was revoked (HTTP 401 on a device call or channel auth, or
+  /// a `device.revoked` event): tear the session down locally WITHOUT calling
+  /// the API, stop heartbeating, drop signaling, forget the credential and go
+  /// back to the enrollment screen.
+  Future<void> _handleRevoked(int epoch) async {
+    if (epoch != _epoch) return; // stale enrollment or already handled
+    _epoch++;
+
+    _heartbeat?.cancel();
+    _heartbeat = null;
+
+    final session = _session;
+    if (session != null) {
+      try {
+        await _endSession(session, notifyServer: false);
+      } catch (_) {}
+    }
+
+    final signaling = _signaling;
+    _signaling = null;
+    if (signaling != null) {
+      try {
+        await signaling.disconnect().timeout(const Duration(seconds: 5));
+      } catch (_) {}
+    }
+    try {
+      await store.clear();
+    } catch (_) {}
+
+    api.setToken(null);
+    deviceId = null;
+    connection = 'disconnected';
+    sessionActive = false;
+    controlActive = false;
+    error = revokedMessage;
+    phase = DaemonPhase.notEnrolled;
+    notifyListeners();
+  }
+
+  Future<void> stopSessionByUser() async {
+    final session = _session;
+    if (session == null) return;
+    await _endSession(session, notifyServer: true, reason: EndReason.userStopped);
+  }
 
   Future<void> refreshAccessibility() async {
     accessibilityEnabled = await input.isEnabled();
@@ -214,14 +376,23 @@ class DeviceDaemon extends ChangeNotifier {
   Future<void> unenroll() async {
     // Bulletproof reset: never let a hung session/connection block the return
     // to the enrollment screen.
-    try {
-      await _endSession(notifyServer: true);
-    } catch (_) {}
+    final session = _session;
+    _epoch++; // stop every callback of the current enrollment
     _heartbeat?.cancel();
-    try {
-      await _signaling?.disconnect();
-    } catch (_) {}
+    _heartbeat = null;
+    if (session != null) {
+      try {
+        await _endSession(session, notifyServer: false);
+      } catch (_) {}
+      try {
+        await api.endSession(session.sessionId, reason: EndReason.userStopped);
+      } catch (_) {}
+    }
+    final signaling = _signaling;
     _signaling = null;
+    try {
+      await signaling?.disconnect();
+    } catch (_) {}
     try {
       await store.clear();
     } catch (_) {}
@@ -235,9 +406,18 @@ class DeviceDaemon extends ChangeNotifier {
     notifyListeners();
   }
 
+  static int? _asInt(dynamic value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value);
+    return null;
+  }
+
   @override
   void dispose() {
+    _epoch++;
     _heartbeat?.cancel();
+    _session?.close();
     _signaling?.disconnect();
     super.dispose();
   }
